@@ -8,8 +8,10 @@
 
 __author__ = "pahaz"
 
+DB_SESS = "session.db"
 DB_FILE = "main.db"
 DEBUG = False
+PASSWORD = 'WEB'
 
 # ===========================
 #
@@ -20,6 +22,7 @@ DEBUG = False
 from cgi import escape
 from urlparse import parse_qs
 import shelve
+import random
 
 
 def http_status(code):
@@ -71,6 +74,67 @@ def take_one_or_None(dict_, key):
 #         1. Model
 #
 # ===========================
+
+class SessionModel(object):
+    def __init__(self):
+        self._db=shelve.open(DB_SESS)
+
+    def exist(self, sessid):
+        return sessid in self._db
+
+    def new(self, content_dict):
+        sessid = str(random.randint(1000,9999))
+        while sessid in self._db:
+            sessid = str(random.randint(1000,9999))
+
+        self._db[sessid] = content_dict
+        self._db.sync()
+        return sessid
+
+    def change(self, sessid, attr, new_val):
+        dict = self._db[sessid]
+        dict[attr]=new_val
+        self._db[sessid]=dict
+        self._db.sync()
+
+    def get(self, sessid, attr):
+        return self._db.get(sessid)[attr]
+
+
+class Session(object):
+    def __init__(self, environ,sessmodel):
+        self.is_new=True
+        self.model = sessmodel
+        cookie = parse_qs(environ['HTTP_COOKIE']) if 'HTTP_COOKIE' in environ else {}
+        if 'sessid' in cookie:
+            if self.model.exist(cookie['sessid'][0]):
+                self.sessid = cookie['sessid'][0]
+                self.is_new = False
+
+        if self.is_new:
+            self.sessid = self.model.new({'passed':False, 'titles_remain':3})
+
+    def can_read(self, ):
+        if self.model.get(self.sessid,'passed'):
+            return True
+
+        titles_remain = self.model.get(self.sessid,'titles_remain')
+
+        if titles_remain:
+            self.model.change(self.sessid, 'titles_remain', titles_remain - 1)
+            return True
+        else:
+            return False
+
+    def set_passed(self):
+        self.model.change(self.sessid, 'passed',True)
+
+    def passed(self):
+        return self.model.get(self.sessid, 'passed')
+
+    def set_cookie(self,response_headers):
+        if self.is_new:
+            response_headers.append(('Set-Cookie','sessid=' + self.sessid))
 
 
 class TextModel(object):
@@ -129,10 +193,10 @@ class Router(object):
     def __init__(self):
         self._paths = {}
 
-    def route(self, request_path, request_get_data):
+    def route(self, request_path, request_get_data, client_session):
 
         if request_path in self._paths:
-            res = self._paths[request_path](request_get_data)
+            res = self._paths[request_path](request_get_data, client_session)
         else:
             res = self.default_response(request_get_data)
 
@@ -146,25 +210,35 @@ class Router(object):
 
 
 class TextController(object):
-    def __init__(self, index_view, add_view, manager):
+    def __init__(self, index_view, add_view, check_password, manager):
         self.index_view = index_view
         self.add_view = add_view
+        self.check_password = check_password
         self.model_manager = manager
 
-    def index(self, request_get_data):
+    def index(self, request_get_data, client_session):
         title = take_one_or_None(request_get_data, "title")
         current_text = self.model_manager.get_by_title(title)
+        error = ''
+
+
+        if current_text:
+            if not client_session.can_read():
+                current_text = None
+                error = 'Log in to continue reading'
 
         all_texts = self.model_manager.get_all()
 
         context = {
+            "passed": client_session.passed(),
             "all": all_texts,
             "current": current_text,
+            "error": error
         }
 
         return 200, self.index_view.render(context)
 
-    def add(self, request_get_data):
+    def add(self, request_get_data, client_session):
         title = take_one_or_None(request_get_data, 'title')
         content = take_one_or_None(request_get_data, 'content')
 
@@ -182,6 +256,12 @@ class TextController(object):
             'error': error,
         }
         return 200, self.add_view.render(context)
+
+    def passw(self, request_get_data, client_session):
+        password = take_one_or_None(request_get_data, 'passw')
+        if password == PASSWORD:
+            client_session.set_passed();
+        return 200, self.check_password.render(None)
 
 
 # ===========================
@@ -203,9 +283,22 @@ class TextIndexView(object):
             {current.content}
             """.format(current=context["current"])
         else:
-            context["content"] = 'What do you want read?'
+            if context['error']:
+                context['content'] = context['error']
+            else:
+                context["content"] = 'What do you want read?'
 
-        t = """
+        if context['passed']:
+            t="You are registred<br/>"
+        else:
+            t="""
+            <form method="GET" action="/text/passw">
+                <input type=password name=passw placeholder="Enter password here" />
+                <input type=submit value='check password' />
+            </form>
+            """
+
+        t+= """
         <form method="GET">
             <input type=text name=title placeholder="Text title" />
             <input type=submit value=read />
@@ -213,7 +306,7 @@ class TextIndexView(object):
         <form method="GET" action="/text/add">
             <input type=text name=title placeholder="Text title" /> <br>
             <textarea name=content placeholder="Text content!" ></textarea> <br>
-            <input type=submit value=write/rewrite />
+            <input type=submit value=write />
         </form>
         <div>{content}</div>
         <ul>{titles}</ul>
@@ -233,13 +326,16 @@ class RedirectView(object):
 #
 # ===========================
 
+sessmodel = SessionModel()
+
 text_manager = TextManager()
-controller = TextController(TextIndexView, RedirectView, text_manager)
+controller = TextController(TextIndexView, RedirectView, RedirectView, text_manager)
 
 router = Router()
 router.register("/", lambda x: (200, "Index HI!"))
 router.register("/text", controller.index)
 router.register("/text/add", controller.add)
+router.register("/text/passw", controller.passw)
 
 
 # ===========================
@@ -249,19 +345,21 @@ router.register("/text/add", controller.add)
 # ===========================
 
 def application(environ, start_response):
+    client_session = Session(environ, sessmodel)
     request_path = environ["PATH_INFO"]
     request_get_data = parse_http_get_data(environ)
 
     # TODO: You can add this interesting line
     # print(parse_http_post_data(environ))
 
-    http_status_code, response_body = router.route(request_path, request_get_data)
+    http_status_code, response_body = router.route(request_path, request_get_data, client_session)
 
     if DEBUG:
         response_body += "<br><br> The request ENV: {0}".format(repr(environ))
 
     response_status = http_status(http_status_code)
     response_headers = [("Content-Type", "text/html")]
+    client_session.set_cookie(response_headers)
 
     start_response(response_status, response_headers)
     return [response_body]  # it could be any iterable.
